@@ -7,14 +7,19 @@
 
 import crypto from 'crypto';
 import { Router, Request, Response } from 'express';
+import rateLimit from 'express-rate-limit';
 import { getShopifyService } from '../services/shopify-service';
 import { storage } from '../storage';
 
 const router = Router();
 const SHOPIFY_DOMAIN_REGEX = /^[a-zA-Z0-9][a-zA-Z0-9-]*\.myshopify\.com$/;
-const OAUTH_RATE_LIMIT_WINDOW_MS = 60_000;
-const OAUTH_RATE_LIMIT_MAX_REQUESTS = 20;
-const oauthRequestLog = new Map<string, number[]>();
+const shopifyOAuthRateLimit = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 20,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many Shopify OAuth requests. Please try again shortly.' },
+});
 
 function normalizeShopDomain(shop: string | undefined): string | null {
   if (!shop) return null;
@@ -79,23 +84,6 @@ function getShopifyServiceForRequest(req: Request) {
   return getShopifyService();
 }
 
-function isWithinOAuthRateLimit(req: Request, scope: 'install' | 'callback'): boolean {
-  const ip = req.ip || req.socket.remoteAddress || 'unknown';
-  const key = `${scope}:${ip}`;
-  const now = Date.now();
-  const previous = oauthRequestLog.get(key) || [];
-  const recent = previous.filter((timestamp) => now - timestamp < OAUTH_RATE_LIMIT_WINDOW_MS);
-
-  if (recent.length >= OAUTH_RATE_LIMIT_MAX_REQUESTS) {
-    oauthRequestLog.set(key, recent);
-    return false;
-  }
-
-  recent.push(now);
-  oauthRequestLog.set(key, recent);
-  return true;
-}
-
 // =============================================================================
 // Shopify App Routes (OAuth + Session Context)
 // =============================================================================
@@ -113,11 +101,7 @@ router.get('/app/config', (req: Request, res: Response) => {
   });
 });
 
-router.get('/app/install', (req: Request, res: Response) => {
-  if (!isWithinOAuthRateLimit(req, 'install')) {
-    return res.status(429).json({ error: 'Too many Shopify install attempts. Please try again shortly.' });
-  }
-
+router.get('/app/install', shopifyOAuthRateLimit, (req: Request, res: Response) => {
   const config = getShopifyAppConfig();
   const shop = normalizeShopDomain(req.query.shop as string);
 
@@ -143,12 +127,8 @@ router.get('/app/install', (req: Request, res: Response) => {
   res.redirect(authUrl.toString());
 });
 
-router.get('/app/callback', async (req: Request, res: Response) => {
+router.get('/app/callback', shopifyOAuthRateLimit, async (req: Request, res: Response) => {
   try {
-    if (!isWithinOAuthRateLimit(req, 'callback')) {
-      return res.status(429).json({ error: 'Too many Shopify OAuth callback attempts. Please try again shortly.' });
-    }
-
     const config = getShopifyAppConfig();
 
     if (!config.apiKey || !config.apiSecret) {
