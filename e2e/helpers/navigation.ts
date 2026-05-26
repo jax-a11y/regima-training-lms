@@ -53,7 +53,9 @@ export async function clickNavLink(page: Page, linkText: string | RegExp): Promi
  * Verify current route
  */
 export async function expectRoute(page: Page, route: string): Promise<void> {
-  await expect(page).toHaveURL(new RegExp(route.replace(/\//g, '\\/')));
+  // Escape special regex characters properly for route matching
+  const escapedRoute = route.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  await expect(page).toHaveURL(new RegExp(escapedRoute));
 }
 
 /**

@@ -31,6 +31,10 @@ concurrency:
   group: e2e-exhaustive-${{ github.ref }}
   cancel-in-progress: true
 
+# Minimal permissions for security
+permissions:
+  contents: read
+
 jobs:
   # Matrix setup for cross-browser testing
   setup:
