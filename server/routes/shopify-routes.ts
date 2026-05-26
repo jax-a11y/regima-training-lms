@@ -5,11 +5,202 @@
  * product management, order processing, and webhook handling.
  */
 
+import crypto from 'crypto';
 import { Router, Request, Response } from 'express';
 import { getShopifyService } from '../services/shopify-service';
 import { storage } from '../storage';
 
 const router = Router();
+const SHOPIFY_DOMAIN_REGEX = /^[a-zA-Z0-9][a-zA-Z0-9-]*\.myshopify\.com$/;
+
+function normalizeShopDomain(shop: string | undefined): string | null {
+  if (!shop) return null;
+  const normalized = shop.trim().toLowerCase();
+  return SHOPIFY_DOMAIN_REGEX.test(normalized) ? normalized : null;
+}
+
+function getShopifyAppConfig() {
+  return {
+    apiKey: process.env.SHOPIFY_APP_API_KEY || '',
+    apiSecret: process.env.SHOPIFY_APP_API_SECRET || '',
+    scopes: process.env.SHOPIFY_APP_SCOPES || 'read_products,read_orders,read_customers,write_products',
+    redirectUri: process.env.SHOPIFY_APP_REDIRECT_URI || '',
+    appUrl: process.env.SHOPIFY_APP_URL || '',
+  };
+}
+
+function resolveRedirectUri(req: Request): string {
+  const config = getShopifyAppConfig();
+  if (config.redirectUri) {
+    return config.redirectUri;
+  }
+
+  return `${req.protocol}://${req.get('host')}/api/shopify/app/callback`;
+}
+
+function verifyOAuthHmac(query: Record<string, string>, secret: string): boolean {
+  const hmac = query.hmac;
+  if (!hmac) return false;
+
+  const params = Object.entries(query)
+    .filter(([key]) => key !== 'hmac' && key !== 'signature')
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, value]) => `${key}=${value}`)
+    .join('&');
+
+  const generatedHmac = crypto
+    .createHmac('sha256', secret)
+    .update(params)
+    .digest('hex');
+
+  const generatedBuffer = Buffer.from(generatedHmac, 'utf8');
+  const incomingBuffer = Buffer.from(hmac, 'utf8');
+  if (generatedBuffer.length !== incomingBuffer.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(generatedBuffer, incomingBuffer);
+}
+
+function getShopifyServiceForRequest(req: Request) {
+  const sessionShop = normalizeShopDomain((req.session as any).shopifyShop);
+  const sessionAccessToken = (req.session as any).shopifyAccessToken as string | undefined;
+
+  if (sessionShop && sessionAccessToken) {
+    return getShopifyService({
+      shopDomain: sessionShop,
+      accessToken: sessionAccessToken,
+    });
+  }
+
+  return getShopifyService();
+}
+
+// =============================================================================
+// Shopify App Routes (OAuth + Session Context)
+// =============================================================================
+
+router.get('/app/config', (req: Request, res: Response) => {
+  const shop = normalizeShopDomain((req.query.shop as string) || (req.session as any).shopifyShop);
+  const config = getShopifyAppConfig();
+
+  res.json({
+    configured: Boolean(config.apiKey && config.apiSecret),
+    apiKey: config.apiKey || undefined,
+    scopes: config.scopes,
+    shop: shop || undefined,
+    hasSessionToken: Boolean((req.session as any).shopifyAccessToken),
+  });
+});
+
+router.get('/app/install', (req: Request, res: Response) => {
+  const config = getShopifyAppConfig();
+  const shop = normalizeShopDomain(req.query.shop as string);
+
+  if (!config.apiKey || !config.apiSecret) {
+    return res.status(400).json({ error: 'Shopify app credentials are not configured' });
+  }
+
+  if (!shop) {
+    return res.status(400).json({ error: 'A valid Shopify shop domain is required' });
+  }
+
+  const state = crypto.randomBytes(16).toString('hex');
+  (req.session as any).shopifyOAuthState = state;
+  (req.session as any).shopifyShop = shop;
+
+  const redirectUri = resolveRedirectUri(req);
+  const authUrl = new URL(`https://${shop}/admin/oauth/authorize`);
+  authUrl.searchParams.set('client_id', config.apiKey);
+  authUrl.searchParams.set('scope', config.scopes);
+  authUrl.searchParams.set('redirect_uri', redirectUri);
+  authUrl.searchParams.set('state', state);
+
+  res.redirect(authUrl.toString());
+});
+
+router.get('/app/callback', async (req: Request, res: Response) => {
+  try {
+    const config = getShopifyAppConfig();
+
+    if (!config.apiKey || !config.apiSecret) {
+      return res.status(400).json({ error: 'Shopify app credentials are not configured' });
+    }
+
+    const query = Object.fromEntries(
+      Object.entries(req.query).map(([key, value]) => [key, Array.isArray(value) ? value[0] : String(value)])
+    );
+
+    const shop = normalizeShopDomain(query.shop);
+    const code = query.code;
+    const state = query.state;
+    const expectedState = (req.session as any).shopifyOAuthState as string | undefined;
+
+    if (!shop || !code || !state) {
+      return res.status(400).json({ error: 'Missing required Shopify OAuth callback parameters' });
+    }
+
+    if (!expectedState || expectedState !== state) {
+      return res.status(400).json({ error: 'Invalid OAuth state' });
+    }
+
+    if (!verifyOAuthHmac(query, config.apiSecret)) {
+      return res.status(400).json({ error: 'Invalid OAuth signature' });
+    }
+
+    const tokenResponse = await fetch(`https://${shop}/admin/oauth/access_token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_id: config.apiKey,
+        client_secret: config.apiSecret,
+        code,
+      }),
+    });
+
+    if (!tokenResponse.ok) {
+      const errorBody = await tokenResponse.text();
+      return res.status(502).json({
+        error: 'Failed to exchange Shopify OAuth token',
+        details: errorBody,
+      });
+    }
+
+    const tokenData = await tokenResponse.json() as { access_token?: string; scope?: string };
+    if (!tokenData.access_token) {
+      return res.status(502).json({ error: 'Shopify OAuth token response did not include access_token' });
+    }
+
+    (req.session as any).shopifyShop = shop;
+    (req.session as any).shopifyAccessToken = tokenData.access_token;
+    (req.session as any).shopifyScopes = tokenData.scope || config.scopes;
+    delete (req.session as any).shopifyOAuthState;
+
+    const host = req.query.host as string | undefined;
+    const appBase = config.appUrl || `${req.protocol}://${req.get('host')}`;
+    const redirectUrl = new URL(appBase);
+    if (host) redirectUrl.searchParams.set('host', host);
+    redirectUrl.searchParams.set('shop', shop);
+    redirectUrl.searchParams.set('embedded', '1');
+    redirectUrl.searchParams.set('shopify_installed', '1');
+
+    return res.redirect(redirectUrl.toString());
+  } catch (error) {
+    console.error('Shopify OAuth callback error:', error);
+    return res.status(500).json({ error: 'Shopify OAuth callback failed' });
+  }
+});
+
+router.get('/app/session', (req: Request, res: Response) => {
+  const shop = normalizeShopDomain((req.session as any).shopifyShop);
+  const accessToken = (req.session as any).shopifyAccessToken as string | undefined;
+
+  res.json({
+    installed: Boolean(shop && accessToken),
+    shop: shop || undefined,
+    scopes: (req.session as any).shopifyScopes || undefined,
+  });
+});
 
 // =============================================================================
 // Product Management Routes
@@ -29,7 +220,7 @@ router.post('/products', async (req: Request, res: Response) => {
       return res.status(404).json({ error: 'Module not found' });
     }
 
-    const shopifyService = getShopifyService();
+    const shopifyService = getShopifyServiceForRequest(req);
     const product = await shopifyService.createCourseProduct(
       module.id,
       module.title,
@@ -58,7 +249,7 @@ router.put('/products/:productId', async (req: Request, res: Response) => {
     const { productId } = req.params;
     const { title, description, price } = req.body;
 
-    const shopifyService = getShopifyService();
+    const shopifyService = getShopifyServiceForRequest(req);
     const product = await shopifyService.updateCourseProduct(productId, {
       title,
       description,
@@ -82,7 +273,7 @@ router.put('/products/:productId', async (req: Request, res: Response) => {
  */
 router.get('/products', async (req: Request, res: Response) => {
   try {
-    const shopifyService = getShopifyService();
+    const shopifyService = getShopifyServiceForRequest(req);
     const products = await shopifyService.getCourseProducts();
 
     res.json({ products });
@@ -99,7 +290,7 @@ router.get('/products', async (req: Request, res: Response) => {
 router.get('/products/:productId', async (req: Request, res: Response) => {
   try {
     const { productId } = req.params;
-    const shopifyService = getShopifyService();
+    const shopifyService = getShopifyServiceForRequest(req);
     const product = await shopifyService.getProduct(productId);
 
     if (!product) {
@@ -131,7 +322,7 @@ router.post('/mappings', async (req: Request, res: Response) => {
       return res.status(404).json({ error: 'Module not found' });
     }
 
-    const shopifyService = getShopifyService();
+    const shopifyService = getShopifyServiceForRequest(req);
     const mapping = shopifyService.createProductMapping(
       shopifyProductId,
       moduleId,
@@ -156,7 +347,7 @@ router.post('/mappings', async (req: Request, res: Response) => {
  */
 router.get('/mappings', async (req: Request, res: Response) => {
   try {
-    const shopifyService = getShopifyService();
+    const shopifyService = getShopifyServiceForRequest(req);
     const mappings = shopifyService.getAllProductMappings();
 
     // Enrich with module data
@@ -188,7 +379,7 @@ router.get('/mappings', async (req: Request, res: Response) => {
 router.delete('/mappings/:productId', async (req: Request, res: Response) => {
   try {
     const { productId } = req.params;
-    const shopifyService = getShopifyService();
+    const shopifyService = getShopifyServiceForRequest(req);
     const deleted = shopifyService.deleteProductMapping(productId);
 
     if (!deleted) {
@@ -216,7 +407,7 @@ router.get('/enrollments', async (req: Request, res: Response) => {
       return res.status(401).json({ error: 'Not authenticated' });
     }
 
-    const shopifyService = getShopifyService();
+    const shopifyService = getShopifyServiceForRequest(req);
     const enrollments = shopifyService.getUserEnrollments(req.session.userId);
 
     // Enrich with module data
@@ -252,7 +443,7 @@ router.get('/access/:moduleId', async (req: Request, res: Response) => {
     }
 
     const moduleId = parseInt(req.params.moduleId);
-    const shopifyService = getShopifyService();
+    const shopifyService = getShopifyServiceForRequest(req);
     const hasAccess = shopifyService.hasModuleAccess(req.session.userId, moduleId);
 
     res.json({ moduleId, hasAccess });
@@ -273,7 +464,7 @@ router.get('/access/:moduleId', async (req: Request, res: Response) => {
 router.get('/customers/:customerId', async (req: Request, res: Response) => {
   try {
     const { customerId } = req.params;
-    const shopifyService = getShopifyService();
+    const shopifyService = getShopifyServiceForRequest(req);
     const customer = await shopifyService.getCustomer(customerId);
 
     if (!customer) {
@@ -294,7 +485,7 @@ router.get('/customers/:customerId', async (req: Request, res: Response) => {
 router.get('/customers/email/:email', async (req: Request, res: Response) => {
   try {
     const { email } = req.params;
-    const shopifyService = getShopifyService();
+    const shopifyService = getShopifyServiceForRequest(req);
     const customer = await shopifyService.getCustomerByEmail(email);
 
     if (!customer) {
@@ -319,7 +510,7 @@ router.get('/customers/email/:email', async (req: Request, res: Response) => {
 router.get('/orders/:orderId', async (req: Request, res: Response) => {
   try {
     const { orderId } = req.params;
-    const shopifyService = getShopifyService();
+    const shopifyService = getShopifyServiceForRequest(req);
     const order = await shopifyService.getOrder(orderId);
 
     if (!order) {
@@ -346,7 +537,7 @@ router.post('/orders/:orderId/process', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'userId is required' });
     }
 
-    const shopifyService = getShopifyService();
+    const shopifyService = getShopifyServiceForRequest(req);
     const order = await shopifyService.getOrder(orderId);
 
     if (!order) {
@@ -376,7 +567,7 @@ router.post('/orders/:orderId/process', async (req: Request, res: Response) => {
  */
 router.post('/webhook', async (req: Request, res: Response) => {
   try {
-    const shopifyService = getShopifyService();
+    const shopifyService = getShopifyServiceForRequest(req);
     
     // Get webhook topic from header
     const topic = req.headers['x-shopify-topic'] as string;
@@ -419,7 +610,7 @@ router.post('/webhooks/register', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'callbackUrl is required' });
     }
 
-    const shopifyService = getShopifyService();
+    const shopifyService = getShopifyServiceForRequest(req);
     await shopifyService.registerWebhooks(callbackUrl);
 
     res.json({ success: true, message: 'Webhooks registered' });
@@ -435,7 +626,7 @@ router.post('/webhooks/register', async (req: Request, res: Response) => {
  */
 router.get('/webhooks', async (req: Request, res: Response) => {
   try {
-    const shopifyService = getShopifyService();
+    const shopifyService = getShopifyServiceForRequest(req);
     const webhooks = await shopifyService.listWebhooks();
 
     res.json({ webhooks });
@@ -457,7 +648,7 @@ router.post('/sync/modules', async (req: Request, res: Response) => {
   try {
     const { defaultPrice = '99.00' } = req.body;
     const modules = await storage.getAllModules();
-    const shopifyService = getShopifyService();
+    const shopifyService = getShopifyServiceForRequest(req);
     
     const results = [];
     
@@ -527,7 +718,7 @@ router.post('/sync/modules', async (req: Request, res: Response) => {
  */
 router.get('/status', async (req: Request, res: Response) => {
   try {
-    const shopifyService = getShopifyService();
+    const shopifyService = getShopifyServiceForRequest(req);
     const mappings = shopifyService.getAllProductMappings();
     
     let productsCount = 0;
@@ -548,8 +739,10 @@ router.get('/status', async (req: Request, res: Response) => {
     }
 
     res.json({
-      configured: !!process.env.SHOPIFY_ACCESS_TOKEN,
-      shopDomain: process.env.SHOPIFY_SHOP_DOMAIN || 'Not configured',
+      configured: !!process.env.SHOPIFY_ACCESS_TOKEN || !!(req.session as any).shopifyAccessToken,
+      shopDomain: (req.session as any).shopifyShop || process.env.SHOPIFY_SHOP_DOMAIN || 'Not configured',
+      appConfigured: Boolean(process.env.SHOPIFY_APP_API_KEY && process.env.SHOPIFY_APP_API_SECRET),
+      appInstalled: Boolean((req.session as any).shopifyShop && (req.session as any).shopifyAccessToken),
       productMappings: mappings.length,
       shopifyProducts: productsCount,
       registeredWebhooks: webhooksCount,

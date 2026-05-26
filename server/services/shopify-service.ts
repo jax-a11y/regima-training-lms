@@ -21,7 +21,7 @@ import type {
 } from '@shared/lms-types';
 
 // Shopify API Configuration
-interface ShopifyConfig {
+export interface ShopifyConfig {
   shopDomain: string;
   accessToken: string;
   apiVersion: string;
@@ -616,14 +616,20 @@ export class ShopifyService {
   }
 }
 
-// Singleton instance
-let shopifyServiceInstance: ShopifyService | null = null;
+// Singleton instances keyed by configuration
+const shopifyServiceInstances = new Map<string, ShopifyService>();
 
 export function getShopifyService(config?: Partial<ShopifyConfig>): ShopifyService {
-  if (!shopifyServiceInstance) {
-    shopifyServiceInstance = new ShopifyService(config);
+  const mergedConfig = { ...DEFAULT_CONFIG, ...config };
+  const key = `${mergedConfig.shopDomain}:${mergedConfig.apiVersion}:${mergedConfig.accessToken}`;
+
+  let instance = shopifyServiceInstances.get(key);
+  if (!instance) {
+    instance = new ShopifyService(config);
+    shopifyServiceInstances.set(key, instance);
   }
-  return shopifyServiceInstance;
+
+  return instance;
 }
 
 export default ShopifyService;
