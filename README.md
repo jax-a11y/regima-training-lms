@@ -197,13 +197,48 @@ function ModulePage({ moduleId }) {
 }
 ```
 
+## Testing
+
+The project uses Playwright for end-to-end testing with comprehensive CI/CD integration.
+
+### Quick Start
+
+```bash
+# Install dependencies
+npm install
+
+# Run smoke tests (critical path)
+npm run test:e2e:smoke
+
+# Run full test suite
+npm run test:e2e
+
+# Interactive UI mode
+npm run test:e2e:ui
+
+# View test report
+npm run test:e2e:report
+```
+
+### CI/CD
+
+Every pull request runs:
+- TypeScript type checking
+- Production build verification
+- E2E smoke tests (critical user journeys)
+
+Nightly exhaustive tests run across all browsers (Chromium, Firefox, WebKit) with mobile viewport testing.
+
+See [Testing Guide](docs/TESTING.md) for detailed documentation.
+
 ## Contributing
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+3. Run tests: `npm run test:e2e:smoke`
+4. Commit your changes (`git commit -m 'Add amazing feature'`)
+5. Push to the branch (`git push origin feature/amazing-feature`)
+6. Open a Pull Request
 
 ## License
 
