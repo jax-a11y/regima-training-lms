@@ -247,6 +247,7 @@ The Shopify integration enables selling training courses through a Shopify store
 
 ### Features
 
+- **Shopify App OAuth**: Install and authorize the LMS integration per Shopify store
 - **Product Sync**: Create Shopify products from training modules
 - **Auto-Enrollment**: Automatically enroll customers on purchase
 - **Access Control**: Time-limited or lifetime access options
@@ -266,6 +267,13 @@ SHOPIFY_API_VERSION=2024-01
 
 # Webhook secret for verification
 SHOPIFY_WEBHOOK_SECRET=your-webhook-secret
+
+# Shopify app OAuth settings
+SHOPIFY_APP_API_KEY=your-app-api-key
+SHOPIFY_APP_API_SECRET=your-app-api-secret
+SHOPIFY_APP_SCOPES=read_products,read_orders,read_customers,write_products
+SHOPIFY_APP_REDIRECT_URI=https://your-domain.com/api/shopify/app/callback
+SHOPIFY_APP_URL=https://your-domain.com
 ```
 
 ### Product-Course Mapping
@@ -298,6 +306,9 @@ The system handles these Shopify webhooks:
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
+| GET | `/api/shopify/app/install?shop=...` | Start Shopify app OAuth install |
+| GET | `/api/shopify/app/callback` | Complete Shopify app OAuth install |
+| GET | `/api/shopify/app/session` | Current Shopify app installation session |
 | POST | `/api/shopify/products` | Create course product |
 | PUT | `/api/shopify/products/:id` | Update product |
 | GET | `/api/shopify/products` | List course products |

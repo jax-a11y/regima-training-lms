@@ -17,6 +17,7 @@ A professional skincare training platform with integrated Learning Management Sy
 - **LTI 1.3**: Embed training content in external LMS platforms (Canvas, Moodle, Blackboard)
 
 ### Shopify Integration
+- **Shopify App OAuth**: Install the LMS as a Shopify app per store with OAuth authorization
 - **Course Sales**: Sell training modules through Shopify stores
 - **Auto-Enrollment**: Automatic course access upon purchase
 - **Access Control**: Time-limited or lifetime access options
@@ -90,6 +91,9 @@ XAPI_PASSWORD=password
 # Shopify (optional)
 SHOPIFY_SHOP_DOMAIN=your-store.myshopify.com
 SHOPIFY_ACCESS_TOKEN=shpat_xxxxx
+SHOPIFY_APP_API_KEY=your-app-api-key
+SHOPIFY_APP_API_SECRET=your-app-api-secret
+SHOPIFY_APP_REDIRECT_URI=https://your-domain.com/api/shopify/app/callback
 ```
 
 ## API Endpoints
@@ -114,6 +118,9 @@ SHOPIFY_ACCESS_TOKEN=shpat_xxxxx
 ### Shopify Integration API
 | Method | Endpoint | Description |
 |--------|----------|-------------|
+| GET | `/api/shopify/app/install?shop=...` | Start Shopify app OAuth install |
+| GET | `/api/shopify/app/callback` | OAuth callback handler |
+| GET | `/api/shopify/app/session` | Current Shopify app installation session |
 | POST | `/api/shopify/products` | Create course product |
 | GET | `/api/shopify/enrollments` | Get user enrollments |
 | POST | `/api/shopify/webhook` | Webhook handler |
