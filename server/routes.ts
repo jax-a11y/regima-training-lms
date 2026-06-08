@@ -617,7 +617,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Initialize and mount integration routes (LMS + Shopify)
   const integrationManager = getIntegrationManager();
   await integrationManager.initialize();
-  app.use('/api', createIntegrationRouter(integrationManager));
+  app.use('/api/integrations', createIntegrationRouter(integrationManager));
 
   const httpServer = createServer(app);
   return httpServer;
