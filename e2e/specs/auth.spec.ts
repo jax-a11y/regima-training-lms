@@ -34,7 +34,7 @@ test.describe('Authentication @smoke', () => {
     await page.getByTestId('button-submit-login').click();
     
     // Should show error message (toast or inline)
-    await expect(page.getByText(/invalid|failed|error|incorrect/i)).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText(/invalid username or password/i).first()).toBeVisible({ timeout: 5000 });
   });
 
   test('should maintain session on page reload @smoke', async ({ page }) => {
