@@ -1,0 +1,233 @@
+name: E2E Exhaustive Tests
+
+on:
+  # Run on schedule (nightly at 2 AM UTC)
+  schedule:
+    - cron: '0 2 * * *'
+  
+  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      browsers:
+        description: 'Browsers to test (comma-separated: chromium,firefox,webkit,mobile-chrome,mobile-safari,tablet)'
+        required: false
+        default: 'chromium,firefox,webkit'
+      shards:
+        description: 'Number of shards for parallel execution'
+        required: false
+        default: '4'
+  
+  # Optionally run on main branch pushes
+  push:
+    branches: [main, master]
+    paths:
+      - 'client/**'
+      - 'server/**'
+      - 'e2e/**'
+      - 'playwright*.config.ts'
+
+# Cancel in-progress runs for the same ref
+concurrency:
+  group: e2e-exhaustive-${{ github.ref }}
+  cancel-in-progress: true
+
+# Minimal permissions for security
+permissions:
+  contents: read
+
+jobs:
+  # Matrix setup for cross-browser testing
+  setup:
+    name: Setup Test Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      browsers: ${{ steps.set-matrix.outputs.browsers }}
+      shards: ${{ steps.set-matrix.outputs.shards }}
+    
+    steps:
+      - name: Set matrix
+        id: set-matrix
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            BROWSERS='${{ github.event.inputs.browsers }}'
+            SHARDS='${{ github.event.inputs.shards }}'
+          else
+            BROWSERS='chromium,firefox,webkit'
+            SHARDS='4'
+          fi
+          
+          # Convert comma-separated to JSON array
+          BROWSERS_JSON=$(echo "$BROWSERS" | jq -R -c 'split(",")')
+          SHARDS_JSON=$(seq 1 "$SHARDS" | jq -R -c -s 'split("\n") | map(select(length > 0))')
+          
+          echo "browsers=$BROWSERS_JSON" >> $GITHUB_OUTPUT
+          echo "shards=$SHARDS_JSON" >> $GITHUB_OUTPUT
+
+  # Build job - shared across all test jobs
+  build:
+    name: Build Application
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Build application
+        run: npm run build
+
+  # E2E tests per browser
+  e2e:
+    name: E2E - ${{ matrix.browser }} (Shard ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: [setup, build]
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: ${{ fromJson(needs.setup.outputs.browsers) }}
+        shard: ${{ fromJson(needs.setup.outputs.shards) }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Install Playwright browsers
+        run: |
+          if [[ "${{ matrix.browser }}" == "chromium" ]] || [[ "${{ matrix.browser }}" == "mobile-chrome" ]]; then
+            npx playwright install chromium --with-deps
+          elif [[ "${{ matrix.browser }}" == "firefox" ]]; then
+            npx playwright install firefox --with-deps
+          elif [[ "${{ matrix.browser }}" == "webkit" ]] || [[ "${{ matrix.browser }}" == "mobile-safari" ]] || [[ "${{ matrix.browser }}" == "tablet" ]]; then
+            npx playwright install webkit --with-deps
+          else
+            npx playwright install --with-deps
+          fi
+      
+      - name: Run E2E tests
+        run: |
+          TOTAL_SHARDS=$(echo '${{ needs.setup.outputs.shards }}' | jq 'length')
+          npx playwright test \
+            --config=playwright.exhaustive.config.ts \
+            --project=${{ matrix.browser }} \
+            --shard=${{ matrix.shard }}/${TOTAL_SHARDS}
+        env:
+          CI: true
+          NODE_ENV: development
+      
+      - name: Upload Playwright report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report-${{ matrix.browser }}-shard-${{ matrix.shard }}
+          path: playwright-report/
+          retention-days: 30
+      
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ matrix.browser }}-shard-${{ matrix.shard }}
+          path: test-results/
+          retention-days: 30
+
+  # Merge reports job
+  merge-reports:
+    name: Merge Test Reports
+    runs-on: ubuntu-latest
+    needs: e2e
+    if: always()
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      - name: Download all reports
+        uses: actions/download-artifact@v4.1.8
+        with:
+          path: all-reports
+          pattern: playwright-report-*
+      
+      - name: Merge reports
+        run: |
+          npm install -g playwright-merge-html-reports || true
+          mkdir -p merged-report
+          
+          # Simple merge - list all report directories
+          echo "Downloaded reports:"
+          ls -la all-reports/ || true
+          
+          # Copy first report as base (if exists)
+          if [ -d "all-reports" ]; then
+            cp -r all-reports/*/. merged-report/ 2>/dev/null || echo "No reports to merge"
+          fi
+      
+      - name: Upload merged report
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-merged
+          path: merged-report/
+          retention-days: 30
+      
+      - name: Generate summary
+        run: |
+          echo "## E2E Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Browser | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          for browser in chromium firefox webkit mobile-chrome mobile-safari tablet; do
+            if ls all-reports/playwright-report-${browser}-* 1> /dev/null 2>&1; then
+              echo "| $browser | ✅ Completed |" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "| $browser | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Download the merged report artifact for detailed results." >> $GITHUB_STEP_SUMMARY
+
+  # Final status check
+  e2e-success:
+    name: E2E Exhaustive Success
+    runs-on: ubuntu-latest
+    needs: [e2e, merge-reports]
+    if: always()
+    
+    steps:
+      - name: Check test results
+        run: |
+          if [[ "${{ needs.e2e.result }}" == "success" ]]; then
+            echo "✅ All E2E tests passed!"
+            exit 0
+          elif [[ "${{ needs.e2e.result }}" == "failure" ]]; then
+            echo "❌ Some E2E tests failed. Check the artifacts for details."
+            exit 1
+          else
+            echo "⚠️ E2E tests were cancelled or skipped"
+            exit 0
+          fi
